@@ -3,6 +3,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { api } from './api.js'
 import CreateTournament from './components/CreateTournament.vue'
 import PairingConsole from './components/PairingConsole.vue'
+import ControlledRepair from './components/ControlledRepair.vue'
 import StandingsTable from './components/StandingsTable.vue'
 import RoundsList from './components/RoundsList.vue'
 import RulesPanel from './components/RulesPanel.vue'
@@ -110,6 +111,8 @@ const currentName = computed(
       @reload="loadStatus"
       @notify="notify"
     />
+
+    <ControlledRepair :status="status" @reload="loadStatus" @notify="notify" />
 
     <StandingsTable :status="status" :tournament-name="currentName" />
 

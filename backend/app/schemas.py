@@ -23,6 +23,20 @@ class PlayerOut(BaseModel):
     name: str
     rating: int
     active: bool
+    withdrawn: bool = False
+    withdrawn_round_no: int | None = None
+    withdrawn_reason: str | None = None
+
+
+# ---- 受控重配对 ----
+
+class WithdrawIn(BaseModel):
+    reason: str = Field(min_length=4)
+
+
+class RepairPlanIn(BaseModel):
+    override_no_repeat: bool = False
+    override_reason: str = ""
 
 
 class TournamentOut(BaseModel):
@@ -59,6 +73,11 @@ class GameOut(BaseModel):
     black_id: int | None
     black_name: str | None
     is_bye: bool
+    board_no: int = 0
+    status: str = "active"
+    started: bool = False
+    started_at: str | None = None
+    cancelled_reason: str | None = None
     verdict: str
     current_result: str
     corrected: bool
@@ -85,6 +104,7 @@ class RoundOut(BaseModel):
     rule_snapshot: dict
     pairing_snapshot: dict
     games: list[GameOut] = []
+    revisions: list[dict] = []
 
 
 class StandingOut(BaseModel):
@@ -106,6 +126,8 @@ class StandingOut(BaseModel):
     tied: bool
     tied_with: list[int]
     correction_count: int
+    withdrawn: bool = False
+    withdrawn_round_no: int | None = None
 
 
 class FullStatus(BaseModel):

@@ -45,6 +45,19 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ new_result: newResult, reason, created_by: '裁判长' }),
     }),
+  markStarted: (gameId) => req(`/games/${gameId}/start`, { method: 'POST' }),
+  withdraw: (tournamentId, playerId, reason) =>
+    req(`/tournaments/${tournamentId}/players/${playerId}/withdraw`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+  createRepairPlan: (tournamentId, { override = false, reason = '' } = {}) =>
+    req(`/tournaments/${tournamentId}/repairs/plan`, {
+      method: 'POST', body: JSON.stringify({
+        override_no_repeat: override, override_reason: reason,
+      }),
+    }),
+  confirmRepair: (revisionId) =>
+    req(`/repairs/${revisionId}/confirm`, { method: 'POST' }),
 }
 
 export const RESULT_LABEL = { W: '白胜', B: '黑胜', D: '和棋', BYE: '轮空' }

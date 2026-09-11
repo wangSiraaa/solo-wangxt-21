@@ -20,6 +20,8 @@ node_modules/
 frontend/dist/
 
 # Local SQLite runtime sidecars; the checked-in demo database remains available
+data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.local.db
+*.log

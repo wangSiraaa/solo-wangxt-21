@@ -1,7 +1,6 @@
 """赛事用例层：报名、配对预览/发布、成绩录入、更正、终局排名。"""
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import timezone
 
 from fastapi import HTTPException
@@ -106,6 +105,12 @@ def preview_pairing(db: Session, tournament_id: int, override_no_repeat: bool,
     if next_no > t.total_rounds:
         raise HTTPException(409, "赛事轮次已全部发布")
     players = _player_states(db, t, rounds)
+    # 与发布保持一致：此前已退赛者不进入配对池
+    already_withdrawn = {
+        p.id for p in t.players
+        if p.withdrawn_round_no is not None and p.withdrawn_round_no <= len(rounds)
+    }
+    players = [p for p in players if p.pid not in already_withdrawn]
     report = solve_pairings(
         players,
         allow_repeat=override_no_repeat,
@@ -132,8 +137,15 @@ def publish_round(db: Session, tournament_id: int, override_no_repeat: bool,
         raise HTTPException(422, "放宽 NO_REPEAT 必须填写不少于 4 个字符的书面理由")
 
     players = _player_states(db, t, rounds)
+    # 此前已退赛者（withdrawn_round_no < 新轮次）不进入新一轮配对池
+    already_withdrawn = {
+        p.id for p in t.players
+        if p.withdrawn_round_no is not None and p.withdrawn_round_no <= len(rounds)
+    }
+    active_players = [p for p in players if p.pid not in already_withdrawn]
     report = solve_pairings(
-        players, allow_repeat=override_no_repeat, override_reason=override_reason
+        active_players, allow_repeat=override_no_repeat,
+        override_reason=override_reason,
     )
     if not report.feasible:
         raise HTTPException(
@@ -146,7 +158,8 @@ def publish_round(db: Session, tournament_id: int, override_no_repeat: bool,
         {"player_id": p.pid, "registration_no": p.registration_no,
          "name": p.name, "rating": p.rating,
          "score_before_round": p.score2 / 2,
-         "whites": p.whites, "blacks": p.blacks, "byes": p.byes}
+         "whites": p.whites, "blacks": p.blacks, "byes": p.byes,
+         "withdrawn": p.pid in already_withdrawn}
         for p in players
     ]
     pairing_snapshot = _report_json(report)
@@ -161,16 +174,15 @@ def publish_round(db: Session, tournament_id: int, override_no_repeat: bool,
     db.add(rd)
     db.flush()
 
-    name = {p.pid: p.name for p in players}
-    for wpid, bpid, _note in report.pairs:
+    for board_no, (wpid, bpid, _note) in enumerate(report.pairs, start=1):
         db.add(models.Game(
             round_id=rd.id, white_id=wpid, black_id=bpid, is_bye=False,
-            verdict="", current_result="",
+            board_no=board_no, verdict="", current_result="",
         ))
     for bpid in report.byes:
         db.add(models.Game(
             round_id=rd.id, white_id=bpid, black_id=None, is_bye=True,
-            verdict="BYE", current_result="BYE",
+            board_no=900, verdict="BYE", current_result="BYE",
         ))
     db.commit()
     db.refresh(rd)
@@ -218,8 +230,14 @@ def enter_result(db: Session, game_id: int, result: str, entered_by: str) -> mod
 
 
 def correct_result(db: Session, game_id: int, new_result: str, reason: str,
-                   created_by: str) -> models.Game:
-    """成绩更正：原裁定 verdict 不动，追加审计记录并重算小分（小分按 current_result 派生）。"""
+                   created_by: str) -> dict:
+    """成绩更正（幂等）。
+
+    - 原裁定 verdict 永不动；变更追加到 result_corrections。
+    - 多次提交"同一裁定"（new_result 等于当前生效结果）只返回已存在变更，
+      不新增审计行——只形成一次有效变更。
+    - 返回排名影响：哪些人的积分/小分/名次因此变化；对阵表本身不受影响。
+    """
     g = db.get(models.Game, game_id)
     if g is None:
         raise HTTPException(404, "对局不存在")
@@ -230,18 +248,60 @@ def correct_result(db: Session, game_id: int, new_result: str, reason: str,
         raise HTTPException(422, f"非法更正结果 {new_result}")
     if not g.verdict:
         raise HTTPException(409, "原裁定尚不存在，应使用正常录入")
-    if new_result == g.current_result:
-        raise HTTPException(422, "新结果与当前生效结果相同")
 
-    corr = models.ResultCorrection(
-        game_id=g.id, old_result=g.current_result, new_result=new_result,
-        reason=reason, created_by=created_by,
-    )
-    db.add(corr)
-    g.current_result = new_result
-    db.commit()
-    db.refresh(g)
-    return g
+    t = db.get(models.Tournament, g.round.tournament_id)
+    rounds = _rounds(db, t)
+    gbr = _games_by_round(db, rounds)
+
+    def _rank_map():
+        rows = compute_standings(t, rounds, gbr)
+        return {s.player_id: s for s in rows}
+
+    before = {pid: {"points": s.points, "buchholz": s.buchholz,
+                    "buchholz_cut1": s.buchholz_cut1, "rank": s.rank}
+              for pid, s in _rank_map().items()}
+
+    idempotent = False
+    if new_result == g.current_result:
+        existing = next((c for c in g.corrections if c.new_result == new_result), None)
+        if existing:
+            idempotent = True
+        else:
+            raise HTTPException(422, "新结果与当前生效结果相同")
+
+    corr = None
+    if not idempotent:
+        corr = models.ResultCorrection(
+            game_id=g.id, old_result=g.current_result, new_result=new_result,
+            reason=reason, created_by=created_by,
+        )
+        db.add(corr)
+        g.current_result = new_result
+        db.commit()
+        db.refresh(g)
+
+    after_map = _rank_map()
+    impacts = []
+    pname = {p.id: p.name for p in t.players}
+    for pid, b in before.items():
+        a = after_map[pid]
+        a_d = {"points": a.points, "buchholz": a.buchholz,
+               "buchholz_cut1": a.buchholz_cut1, "rank": a.rank}
+        if a_d != b:
+            impacts.append({"player_id": pid, "name": pname[pid],
+                            "before": b, "after": a_d})
+
+    return {
+        "game_id": g.id, "verdict": g.verdict, "current_result": g.current_result,
+        "idempotent": idempotent,
+        "correction": None if idempotent else {
+            "old_result": corr.old_result, "new_result": corr.new_result,
+            "reason": corr.reason,
+        },
+        "ranking_impact": impacts,
+        "note": ("重复提交同一裁定：未产生新变更（幂等）" if idempotent
+                 else "原裁定保留；积分与小分已重算，对阵表不变"),
+    }
 
 
 # ---------------------------------------------------------------- 排名 / 全量状态
@@ -269,24 +329,37 @@ def full_status(db: Session, tournament_id: int, include_preview: bool,
     pname = {p.id: p.name for p in t.players}
 
     rounds_out = []
+    from .repairs import round_revisions
     for rd in rounds:
         games = []
         for g in gbr[rd.id]:
             games.append({
                 "id": g.id,
+                "board_no": g.board_no,
                 "white_id": g.white_id, "white_name": pname.get(g.white_id) if g.white_id else None,
                 "black_id": g.black_id, "black_name": pname.get(g.black_id) if g.black_id else None,
                 "is_bye": g.is_bye,
+                "status": g.status,
+                "started": g.started_at is not None,
+                "started_at": g.started_at.astimezone(timezone.utc).isoformat() if g.started_at else None,
+                "cancelled_reason": g.cancelled_reason,
                 "verdict": g.verdict, "current_result": g.current_result,
-                "corrected": g.current_result != g.verdict,
+                "corrected": bool(g.verdict) and g.current_result != g.verdict,
                 "corrections": [{
                     "id": c.id, "old_result": c.old_result, "new_result": c.new_result,
                     "reason": c.reason, "created_by": c.created_by,
                     "created_at": c.created_at.astimezone(timezone.utc).isoformat(),
                 } for c in g.corrections],
             })
-        games.sort(key=lambda x: (x["is_bye"],
-                                  x["white_name"] or ""))
+        games.sort(key=lambda x: (x["status"] != "active", x["is_bye"],
+                                  x["board_no"], x["white_name"] or ""))
+        revisions = [{
+            "id": rv.id, "status": rv.status, "kind": rv.kind, "reason": rv.reason,
+            "created_at": rv.created_at.astimezone(timezone.utc).isoformat(),
+            "applied_at": rv.applied_at.astimezone(timezone.utc).isoformat() if rv.applied_at else None,
+            "expiry_note": rv.expiry_note,
+            "diff": rv.diff_summary,
+        } for rv in round_revisions(db, rd.id)]
         rounds_out.append({
             "id": rd.id, "round_no": rd.round_no, "rule_version": rd.rule_version,
             "published_at": rd.published_at.astimezone(timezone.utc).isoformat(),
@@ -295,6 +368,7 @@ def full_status(db: Session, tournament_id: int, include_preview: bool,
             "rule_snapshot": rd.rule_snapshot,
             "pairing_snapshot": rd.pairing_snapshot,
             "games": games,
+            "revisions": revisions,
         })
 
     next_no = len(rounds) + 1
@@ -304,6 +378,9 @@ def full_status(db: Session, tournament_id: int, include_preview: bool,
             "players": [{
                 "id": p.id, "registration_no": p.registration_no,
                 "name": p.name, "rating": p.rating, "active": p.active,
+                "withdrawn": p.withdrawn_round_no is not None,
+                "withdrawn_round_no": p.withdrawn_round_no,
+                "withdrawn_reason": p.withdrawn_reason,
             } for p in sorted(t.players, key=lambda x: x.registration_no)],
         },
         "rules": RULES,
@@ -317,6 +394,8 @@ def full_status(db: Session, tournament_id: int, include_preview: bool,
             "color_white": s.color_white, "color_black": s.color_black,
             "tied": len(s.tied_with) > 1, "tied_with": s.tied_with,
             "correction_count": s.correction_count,
+            "withdrawn": s.withdrawn,
+            "withdrawn_round_no": s.withdrawn_round_no,
         } for s in standings_rows],
         "rounds": rounds_out,
         "next_round_no": next_no if next_no <= t.total_rounds else None,

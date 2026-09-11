@@ -3,17 +3,21 @@
 设计原则
 --------
 硬约束（无解也绝不悄悄放松）：
-  ONE_GAME_PER_ROUND  每人每轮恰好出场一次（参赛或轮空）
-  NO_REPEAT           任何两人不重复交手
-  BYE_COUNT           奇数人数恰好 1 个轮空，偶数 0 个
+  ONE_GAME_PER_ROUND  每名在场选手每轮恰好出场一次（参赛或轮空）
+  NO_REPEAT           任何两人不重复交手（含已开赛锁定的棋桌）
+  BYE_COUNT           在场奇数人数恰好 1 个轮空，偶数 0 个
+  LOCKED_BOARDS       受控重排时，已开赛棋桌保持不动（选手、颜色、结果）
 
 软约束按字典序（lexicographic）分层最小化，先后顺序本身就是规则的一部分：
   A. SCORE_PROXIMITY  对阵双方积分差
   B. BYE_FAIRNESS     轮空给积分最低、历史轮空最少者
-  C. COLOR_BALANCE    先后手总差，其次避免连续同色
+  C. COLOR_BALANCE    先后手总差，其次避免连续同色（锁定棋桌同样计入评估）
 
 每一层在上一层取得最优值后才优化，因此报告可以明确指出"被放宽的是哪一层、
 放宽到什么程度、影响哪些选手"，而不是给出一张看不出依据的对阵表。
+
+solve_repair 支持受控重配对：locked_pairs 中的棋桌原样固定，excluded_ids
+（退赛者）不进入求解池，只对其余空闲选手重新求解。
 """
 from __future__ import annotations
 
@@ -45,11 +49,13 @@ class PlayerState:
 class PairingReport:
     feasible: bool
     rule_version: str
-    pairs: list[tuple[int, int, str]]          # (白方pid, 黑方pid, 颜色依据) — 轮空不在此
+    pairs: list[tuple[int, int, str]]          # (白方pid, 黑方pid, 颜色依据)
     byes: list[int]
     player_reasons: dict[int, dict]
     tiers: list[dict]
     hard_constraints: list[dict]
+    locked_pairs: list[tuple[int, int]] = field(default_factory=list)
+    excluded: list[int] = field(default_factory=list)
     infeasibility: dict | None = None
     objective_values: dict[str, int] = field(default_factory=dict)
     overrides: list[dict] = field(default_factory=list)
@@ -60,25 +66,51 @@ class PairingReport:
 _SOLVER_SECONDS = 5.0
 
 
+def _constant_color_cost(locked_pairs, all_present):
+    """锁定棋桌选手对 C 层目标的固定贡献（先后手差 + 连续同色）。"""
+    locked_color = {}
+    for w, b in locked_pairs:
+        locked_color[w] = "W"
+        locked_color[b] = "B"
+    cost = 0
+    for p in all_present:
+        w_new = p.whites + (1 if locked_color.get(p.pid) == "W" else 0)
+        b_new = p.blacks + (1 if locked_color.get(p.pid) == "B" else 0)
+        cost += 4 * abs(w_new - b_new)
+        if p.last_color and locked_color.get(p.pid) == p.last_color:
+            cost += 1
+    return cost, locked_color
+
+
 def _build_and_solve(
     players: list[PlayerState],
     required_byes: int,
     allow_repeat: bool,
+    locked_pairs: list[tuple[int, int]] | None = None,
+    excluded: set[int] | None = None,
     bound_a: int | None = None,
     bound_b: int | None = None,
     *,
     with_objectives: bool = True,
 ):
-    """构造并求解 CP 模型；返回 (solver, model, vars) 或 (None, model, vars)。"""
-    n = len(players)
-    m = cp_model.CpModel()
-    idx = {p.pid: k for k, p in enumerate(players)}
+    """构造并求解 CP 模型。返回 (solver_or_None, vars)。"""
+    locked_pairs = locked_pairs or []
+    excluded = excluded or set()
 
-    # 只有"尚未交手"的两人之间才存在对阵边；授权放宽时全部放开
-    edge: dict[tuple[int, int], ...] = {}
+    locked_white = {w for w, _ in locked_pairs}
+    locked_black = {b for _, b in locked_pairs}
+    locked_all = locked_white | locked_black
+
+    # 求解池：在场且未锁定的空闲选手（退赛者不进入）
+    free = [p for p in players if p.pid not in locked_all and p.pid not in excluded]
+    n = len(free)
+    m = cp_model.CpModel()
+
+    edge: dict[tuple[int, int], object] = {}
     for a in range(n):
         for b in range(a + 1, n):
-            pa, pb = players[a], players[b]
+            pa, pb = free[a], free[b]
+            # NO_REPEAT：历史对手（含锁定棋桌这一轮的交手）不连边
             if allow_repeat or pb.pid not in pa.opponents:
                 edge[(a, b)] = m.NewBoolVar(f"e_{a}_{b}")
 
@@ -90,49 +122,42 @@ def _build_and_solve(
         incident[a].append(e)
         incident[b].append(e)
 
-    # 硬：每人恰好出场一次（一盘比赛 或 轮空）
+    # 硬：每名空闲选手恰好出场一次（一盘比赛 或 轮空）
     for k in range(n):
         m.Add(sum(incident[k]) + bye[k] == 1)
-
-    # 硬：轮空总数
     m.Add(sum(bye) == required_byes)
 
     # 每盘恰好一名称白方（未选中的边不施加方向约束，避免交叉约束）
     for (a, b), e in edge.items():
         m.Add(white[a] + white[b] == 1).OnlyEnforceIf(e)
-    # 轮空者不执白；非轮空者由出场约束保证恰好在一条边内
     for k in range(n):
         m.Add(white[k] + bye[k] <= 1)
 
-    # ---- 目标 ----
+    # ---- A：积分差（仅自由新盘） ----
     obj_a = 0
     for (a, b), e in edge.items():
-        gap2 = abs(players[a].score2 - players[b].score2)
-        obj_a += gap2 * e
+        obj_a += abs(free[a].score2 - free[b].score2) * e
 
+    # ---- B：轮空公平 ----
     obj_b = 0
-    for k, p in enumerate(players):
-        # 积分越低（10×半子）、轮空历史越少（×3）越应拿轮空
+    for k, p in enumerate(free):
         obj_b += (10 * p.score2 + 3 * p.byes) * bye[k]
 
+    # ---- C：颜色（自由新盘的变量部分 + 锁定棋桌的固定部分） ----
     obj_c_terms = []
-    for k, p in enumerate(players):
-        plays = sum(incident[k])  # = 1 - bye
-        # 新差值 = (whites-blacks) + 2*white - plays(+bye 抵消，见模块文档)
-        # plays = 1 - bye，故 diff = base + 2*white - 1 + bye
+    for k, p in enumerate(free):
         base = p.whites - p.blacks
         diff = m.NewIntVar(-n, n, f"diff_{k}")
         m.Add(diff == base + 2 * white[k] - 1 + bye[k])
         aux = m.NewIntVar(0, n, f"absdiff_{k}")
         m.AddAbsEquality(aux, diff)
         obj_c_terms.append(4 * aux)
-        # 连续同色罚分（线性化）
         if p.last_color == "W":
-            obj_c_terms.append(white[k])          # 本轮再执白
+            obj_c_terms.append(white[k])
         elif p.last_color == "B":
-            obj_c_terms.append(plays - white[k])  # 本轮再执黑；bye 时该项为 0
-
-    obj_c = sum(obj_c_terms)
+            obj_c_terms.append(sum(incident[k]) - white[k])
+    locked_cost, _ = _constant_color_cost(locked_pairs, players)
+    obj_c = sum(obj_c_terms) + locked_cost
 
     if bound_a is not None:
         m.Add(obj_a <= bound_a)
@@ -153,149 +178,216 @@ def _build_and_solve(
     solver.parameters.random_seed = 20260911
     status = solver.Solve(m)
     ok = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
-    return (solver if ok else None), {
-        "model": m, "edge": edge, "bye": bye, "white": white,
-        "obj_a": obj_a, "obj_b": obj_b, "obj_c": obj_c, "idx": idx,
-    }
+    v = {"edge": edge, "bye": bye, "white": white, "free": free,
+         "obj_a": obj_a, "obj_b": obj_b, "obj_c": obj_c}
+    return (solver if ok else None), v
 
 
-def solve_pairings(
+def solve_pairings(players: Iterable[PlayerState], *, required_byes: int | None = None,
+                   allow_repeat: bool = False, override_reason: str = "") -> PairingReport:
+    """普通发布：无锁定棋桌、无退赛者。"""
+    return solve_repair(list(players), locked_pairs=[], excluded_ids=set(),
+                        required_byes=required_byes, allow_repeat=allow_repeat,
+                        override_reason=override_reason)
+
+
+def solve_repair(
     players: Iterable[PlayerState],
     *,
+    locked_pairs: list[tuple[int, int]],
+    excluded_ids: set[int],
     required_byes: int | None = None,
     allow_repeat: bool = False,
     override_reason: str = "",
 ) -> PairingReport:
+    """受控重配对：锁定棋桌不动，退赛者移出，空闲选手重新求解。"""
     players = list(players)
-    n = len(players)
+    locked_pairs = list(locked_pairs)
+    excluded = set(excluded_ids)
+
+    by_id = {p.pid: p for p in players}
+    # 数据完整性校验：锁定/排除的选手必须存在，退赛者不能出现在锁定桌
+    for w, b in locked_pairs:
+        if w not in by_id or b not in by_id:
+            raise ValueError("锁定棋桌包含不存在的选手")
+        if w in excluded or b in excluded:
+            raise ValueError("退赛选手不能出现在已开赛锁定棋桌中")
+
+    present = [p for p in players if p.pid not in excluded]
+    locked_all = {x for pair in locked_pairs for x in pair}
+    free = [p for p in present if p.pid not in locked_all]
     if required_byes is None:
-        required_byes = n % 2
+        required_byes = len(present) % 2
 
-    if n == 0:
-        return PairingReport(
-            feasible=True, rule_version=RULES_VERSION, pairs=[], byes=[],
-            player_reasons={}, tiers=[], hard_constraints=_hard_status(n, [], []),
-        )
+    if not free:
+        # 全员锁定/退赛：没有需要求解的部分
+        return _extract(None, {"edge": {}, "bye": [], "white": [], "free": [],
+                               "obj_a": 0, "obj_b": 0, "obj_c":
+                                   _constant_color_cost(locked_pairs, present)[0]},
+                        present, locked_pairs, excluded, required_byes,
+                        allow_repeat, override_reason,
+                        {"A": 0, "B": 0, "C": _constant_color_cost(locked_pairs, present)[0]},
+                        all_locked=True, all_players=players)
 
-    # 字典序三层求解：A → A 最优下的 B → A、B 最优下的 C
-    s_a, v = _build_and_solve(players, required_byes, allow_repeat)
+    s_a, v = _build_and_solve(present, required_byes, allow_repeat,
+                              locked_pairs, excluded)
     if s_a is None:
-        return _infeasible_report(players, required_byes, allow_repeat, override_reason)
+        return _infeasible_report(present, locked_pairs, excluded,
+                                  required_byes, allow_repeat, override_reason)
 
     val_a = s_a.Value(v["obj_a"])
-    s_b, v = _build_and_solve(players, required_byes, allow_repeat, bound_a=val_a)
+    s_b, v = _build_and_solve(present, required_byes, allow_repeat,
+                              locked_pairs, excluded, bound_a=val_a)
     assert s_b is not None
     val_b = s_b.Value(v["obj_b"])
-    s_c, v = _build_and_solve(
-        players, required_byes, allow_repeat, bound_a=val_a, bound_b=val_b
-    )
+    s_c, v = _build_and_solve(present, required_byes, allow_repeat,
+                              locked_pairs, excluded, bound_a=val_a, bound_b=val_b)
     assert s_c is not None
     val_c = s_c.Value(v["obj_c"])
 
-    return _extract(s_c, v, players, required_byes, allow_repeat, override_reason,
-                    {"A": val_a, "B": val_b, "C": val_c})
+    return _extract(s_c, v, present, locked_pairs, excluded, required_byes,
+                    allow_repeat, override_reason,
+                    {"A": val_a, "B": val_b, "C": val_c},
+                    all_players=players)
 
 
 # ---------------------------------------------------------------- 结果组装
 
-def _extract(solver, v, players, required_byes, allow_repeat, override_reason, vals):
-    edge, bye_v, white_v = v["edge"], v["bye"], v["white"]
-    pid = [p.pid for p in players]
+def _extract(solver, v, present, locked_pairs, excluded, required_byes,
+             allow_repeat, override_reason, vals, *, all_locked=False,
+             all_players=None):
+    free: list[PlayerState] = v["free"]
+    pid = [p.pid for p in free]
+    pstate = {p.pid: p for p in present}
+    name = {p.pid: p.name for p in present}
+    score_of = {p.pid: p.score2 / 2 for p in present}
 
-    chosen_edges = [(a, b) for (a, b), e in edge.items() if solver.Value(e) == 1]
-    byes = [players[k].pid for k in range(len(players)) if solver.Value(bye_v[k]) == 1]
+    locked_white = {w for w, _ in locked_pairs}
+    locked_black = {b for _, b in locked_pairs}
+    locked_all = locked_white | locked_black
+
+    chosen_edges, byes = [], []
+    if not all_locked:
+        edge, bye_v, white_v = v["edge"], v["bye"], v["white"]
+        chosen_edges = [(a, b) for (a, b), e in edge.items() if solver.Value(e) == 1]
+        byes = [free[k].pid for k in range(len(free)) if solver.Value(bye_v[k]) == 1]
+    else:
+        edge, bye_v, white_v = {}, [], []
 
     pairs: list[tuple[int, int, str]] = []
-    plays_as: dict[int, tuple[int, int, str]] = {}
+    plays_as: dict[int, tuple[int, str, str]] = {}
+
+    # 新求解出的棋桌
     for a, b in chosen_edges:
-        if solver.Value(white_v[a]) == 1:
-            w, bk = a, b
-        else:
-            w, bk = b, a
-        color_note = _color_note(players[w], players[bk])
-        pairs.append((pid[w], pid[bk], color_note))
-        plays_as[pid[w]] = (pid[bk], "W", color_note)
-        plays_as[pid[bk]] = (pid[w], "B", color_note)
+        w, bk = (a, b) if solver.Value(white_v[a]) == 1 else (b, a)
+        note = _color_note(free[w], free[bk])
+        pairs.append((pid[w], pid[bk], note))
+        plays_as[pid[w]] = (pid[bk], "W", note)
+        plays_as[pid[bk]] = (pid[w], "B", note)
 
-    name = {p.pid: p.name for p in players}
-    score_of = {p.pid: p.score2 / 2 for p in players}
-    pstate = {p.pid: p for p in players}
+    # 锁定棋桌（颜色固定）
+    for wpid, bpid in locked_pairs:
+        pw, pb = pstate[wpid], pstate[bpid]
+        note = f"已开赛棋桌锁定：维持原台次安排（{pw.name} 执白 / {pb.name} 执黑），不参与重排"
+        pairs.append((wpid, bpid, note))
+        plays_as[wpid] = (bpid, "W", note)
+        plays_as[bpid] = (wpid, "B", note)
 
-    # ---- 每选手的配对依据 ----
+    pair_gaps = {}
+    for (wpid, bpid, _) in pairs:
+        pair_gaps[wpid] = pair_gaps[bpid] = abs(score_of[wpid] - score_of[bpid])
+
+    # ---- 每选手依据 ----
     reasons: dict[int, dict] = {}
-    pair_gaps: dict[int, float] = {}
-    for (wpid, bpid, _note) in pairs:
-        g = abs(score_of[wpid] - score_of[bpid])
-        pair_gaps[wpid] = g
-        pair_gaps[bpid] = g
-
-    for p in players:
+    for p in present:
         if p.pid in byes:
-            same_low = [q.pid for q in players
-                        if q.score2 == p.score2 and q.byes == p.byes]
             reasons[p.pid] = {
-                "name": p.name,
-                "role": "bye",
-                "headline": f"轮空（直接记 1 分）",
+                "name": p.name, "role": "bye",
+                "headline": "轮空（直接记 1 分）",
                 "factors": [
                     f"当前积分 {p.score2 / 2:g}",
                     f"历史轮空 {p.byes} 次",
-                    f"同分同轮空次数候选共 {len(same_low)} 人，按确定性规则选中",
+                    "在可重排选手中按 B 层轮空公平规则选中",
                 ],
             }
             continue
         opp_pid, color, note = plays_as[p.pid]
         opp = pstate[opp_pid]
         gap = pair_gaps[p.pid]
+        locked = p.pid in locked_all
         factors = [
             f"对手 {opp.name}，积分 {opp.score2 / 2:g}，积分差 {gap:g}",
             f"本轮执{'白' if color == 'W' else '黑'}：{note}",
-            f"本人累计 白{ p.whites + (1 if color == 'W' else 0)} / "
+            f"本人赛后累计 白{p.whites + (1 if color == 'W' else 0)} / "
             f"黑{p.blacks + (1 if color == 'B' else 0)}",
         ]
+        if locked:
+            factors.insert(0, "🔒 棋桌已开赛，受控重排中保持不动")
         if opp_pid in p.opponents:
             factors.append("⚠ 与对手曾交手——本次对阵来自 NO_REPEAT 授权放宽")
         reasons[p.pid] = {
             "name": p.name,
-            "role": "paired",
-            "color": color,
-            "opponent_id": opp_pid,
-            "opponent_name": opp.name,
+            "role": "locked" if locked else "paired",
+            "color": color, "opponent_id": opp_pid, "opponent_name": opp.name,
             "score_gap": gap,
-            "headline": f"对阵 {opp.name}（积分差 {gap:g}），执{'白' if color == 'W' else '黑'}",
+            "headline": ("🔒 棋桌锁定：" if locked else "对阵 ")
+                        + f"{opp.name}（积分差 {gap:g}），执{'白' if color == 'W' else '黑'}",
             "factors": factors,
         }
+    # 退赛者：不在对阵中，但依据里显式说明
+    all_by_id = {p.pid: p for p in (all_players or present)}
+    for xid in sorted(excluded):
+        xp = all_by_id.get(xid)
+        if xp is None:
+            continue
+        reasons[xp.pid] = {
+            "name": xp.name, "role": "withdrawn",
+            "headline": "已退赛：本轮移出配对池，不安排棋桌",
+            "factors": [
+                f"当前积分 {xp.score2 / 2:g}（既有成绩保留）",
+                "后续轮次不再配对；已取得的积分与对手小分按锁定规则继续计入排名",
+            ],
+        }
 
-    # ---- 三层软约束报告 ----
-    # A：所有对阵都在同分组才算完全满足
+    return _finalize(report=None, present=present, pairs=pairs, byes=byes,
+                     reasons=reasons, locked_pairs=locked_pairs, excluded=excluded,
+                     vals=vals, allow_repeat=allow_repeat,
+                     override_reason=override_reason, plays_as=plays_as,
+                     required_byes=required_byes)
+
+
+def _finalize(*, report, present, pairs, byes, reasons, locked_pairs, excluded,
+              vals, allow_repeat, override_reason, plays_as, required_byes):
+    pstate = {p.pid: p for p in present}
+    name = {p.pid: p.name for p in present}
+
+    # 退赛者依据（在 reasons 里单独记录，但他们不在对阵中）
+    # excluded 选手不在 present 中——需要调用方补充，见下方 solve_repair 的包装处理
+    # ---- A 层报告（只统计新求解的棋桌：锁定桌不是配对选择） ----
+    free_pairs = [(w, b) for (w, b, _) in pairs if w not in {x for pa in locked_pairs for x in pa}]
     gap_pairs = [
-        {"white": name[w], "black": name[b], "gap_half_points": int(score2gap(players, w, b))}
-        for (w, b, _) in pairs
-        if pair_gaps[w] > 0
+        {"white": name[w], "black": name[b],
+         "gap_half_points": int(abs(pstate[w].score2 - pstate[b].score2))}
+        for (w, b) in free_pairs if pstate[w].score2 != pstate[b].score2
     ]
-    tiers = [
-        {
-            "tier": "A", "code": "SCORE_PROXIMITY",
-            "status": "SATISFIED" if vals["A"] == 0 else "RELAXED",
-            "optimal_value_half_points": vals["A"],
-            "detail": ("全部对阵积分相同" if vals["A"] == 0
-                       else f"{len(gap_pairs)} 盘跨积分组，最小可达积分差合计 {vals['A']} 半子"),
-            "affected_pairs": gap_pairs,
-        },
-    ]
+    tiers = [{
+        "tier": "A", "code": "SCORE_PROXIMITY",
+        "status": "SATISFIED" if vals["A"] == 0 else "RELAXED",
+        "optimal_value_half_points": vals["A"],
+        "detail": ("全部对阵积分相同" if vals["A"] == 0
+                   else f"{len(gap_pairs)} 张{'重排' if locked_pairs else ''}棋桌跨积分组，"
+                        f"最小可达积分差合计 {vals['A']} 半子"),
+        "affected_pairs": gap_pairs,
+    }]
 
-    # B：被选轮空者是否位于"最低积分且其中轮空最少"的理想集合
-    if required_byes > 0:
+    if required_byes > 0 and byes:
         bye_pid = byes[0]
         bp = pstate[bye_pid]
-        min_score = min(p.score2 for p in players)
-        min_byes_among_low = min(p.byes for p in players if p.score2 == min_score)
+        eligible = [p for p in present if p.pid not in
+                    {x for pa in locked_pairs for x in pa}]
+        min_score = min(p.score2 for p in eligible)
+        min_byes_among_low = min(p.byes for p in eligible if p.score2 == min_score)
         ideal = bp.score2 == min_score and bp.byes == min_byes_among_low
-        blocked = [
-            {"name": q.name, "score": q.score2 / 2, "prior_byes": q.byes}
-            for q in players
-            if (q.score2, q.byes) < (bp.score2, bp.byes)
-        ]
         tiers.append({
             "tier": "B", "code": "BYE_FAIRNESS",
             "status": "SATISFIED" if ideal else "RELAXED",
@@ -303,70 +395,48 @@ def _extract(solver, v, players, required_byes, allow_repeat, override_reason, v
             "detail": (
                 f"轮空给 {bp.name}（{bp.score2 / 2:g} 分，历史轮空 {bp.byes} 次），"
                 + ("位于最低积分且轮空最少的理想集合" if ideal
-                   else "理想集合内选手均已被更高优先级约束占用")
+                   else "理想集合内选手或已被锁定棋桌占用或已退赛")
             ),
             "bye_player": bp.name,
-            "preferred_candidates_blocked": blocked,
         })
 
-    # C：颜色
-    post_imb = []
-    repeats = []
-    for p in players:
+    post_imb, repeats = [], []
+    for p in present:
         w = p.whites + (1 if p.pid in plays_as and plays_as[p.pid][1] == "W" else 0)
         b = p.blacks + (1 if p.pid in plays_as and plays_as[p.pid][1] == "B" else 0)
-        if p.pid in byes:
-            w, b = p.whites, p.blacks
         post_imb.append(abs(w - b))
-        if p.pid in plays_as and plays_as[p.pid][1] and p.last_color == plays_as[p.pid][1]:
+        if p.pid in plays_as and p.last_color == plays_as[p.pid][1] and p.pid not in {x for pa in locked_pairs for x in pa}:
             repeats.append(p.name)
     c_ok = max(post_imb, default=0) <= 1 and not repeats
     tiers.append({
         "tier": "C", "code": "COLOR_BALANCE",
         "status": "SATISFIED" if c_ok else "RELAXED",
         "optimal_value": vals["C"],
-        "detail": (
-            f"赛后最大先后手差 {max(post_imb, default=0)}，连续同色 {len(repeats)} 人次"
-            + (f"（{', '.join(repeats)}）" if repeats else "")
-        ),
+        "detail": (f"在场选手赛后最大先后手差 {max(post_imb, default=0)}，"
+                   f"连续同色 {len(repeats)} 人次"
+                   + (f"（{', '.join(repeats)}）" if repeats else "")),
         "max_imbalance": max(post_imb, default=0),
         "repeat_color_players": repeats,
     })
 
     overrides = []
     if allow_repeat:
-        repeated = [
-            {"players": [name[w], name[b]]}
-            for (w, b, _) in pairs
-            if b in pstate[w].opponents if False  # 占位，下面按 pid 重算
-        ]
-        repeated = []
-        for wpid, bpid, _ in pairs:
-            if bpid in pstate[wpid].opponents:
-                repeated.append({"players": [name[wpid], name[bpid]]})
-        overrides.append({
-            "code": "NO_REPEAT", "reason": override_reason,
-            "repeated_matchups": repeated,
-        })
+        repeated = [{"players": [name[w], name[b]]}
+                    for (w, b, _) in pairs if b in pstate[w].opponents]
+        overrides.append({"code": "NO_REPEAT", "reason": override_reason,
+                          "repeated_matchups": repeated})
 
     return PairingReport(
-        feasible=True,
-        rule_version=RULES_VERSION,
+        feasible=True, rule_version=RULES_VERSION,
         pairs=sorted(pairs, key=lambda t: (min(t[0], t[1]),)),
-        byes=byes,
-        player_reasons=reasons,
-        tiers=tiers,
-        hard_constraints=_hard_status(len(players), pairs, overrides, allow_repeat),
+        byes=byes, player_reasons=reasons, tiers=tiers,
+        hard_constraints=_hard_status(len(present), len(excluded), pairs,
+                                      locked_pairs, overrides, allow_repeat),
+        locked_pairs=locked_pairs, excluded=sorted(excluded),
         objective_values={"A_score_gap_half_points": vals["A"], "B_bye": vals["B"],
                           "C_color": vals["C"]},
         overrides=overrides,
     )
-
-
-def score2gap(players, wpid, bpid):
-    """pairs 里是 pid，这里需要按 pid 查分差（半子）。"""
-    by_pid = {p.pid: p for p in players}
-    return abs(by_pid[wpid].score2 - by_pid[bpid].score2)
 
 
 def _color_note(white_p: PlayerState, black_p: PlayerState) -> str:
@@ -384,31 +454,36 @@ def _color_note(white_p: PlayerState, black_p: PlayerState) -> str:
 
 # ---------------------------------------------------------------- 硬约束状态
 
-def _hard_status(n, pairs, overrides, allow_repeat=False):
+def _hard_status(n_present, n_excluded, pairs, locked_pairs, overrides, allow_repeat=False):
     no_repeat_status = "OVERRIDDEN" if allow_repeat else "SATISFIED"
     return [
         {"code": "ONE_GAME_PER_ROUND", "status": "SATISFIED",
-         "detail": f"{n} 人各出场一次"},
+         "detail": f"{n_present} 名在场选手各出场一次（退赛 {n_excluded} 人移出）"},
         {"code": "NO_REPEAT", "status": no_repeat_status,
          "detail": "已交手选手之间不生成对阵边" if not allow_repeat
                    else f"已授权放宽：{overrides[0]['reason'] if overrides else ''}"},
         {"code": "BYE_COUNT", "status": "SATISFIED",
-         "detail": f"人数 {n} 为{'奇' if n % 2 else '偶'}，轮空 {n % 2} 人"},
+         "detail": f"在场 {n_present} 人为{'奇' if n_present % 2 else '偶'}，轮空 {n_present % 2} 人"},
+        {"code": "LOCKED_BOARDS",
+         "status": "SATISFIED" if locked_pairs else "NOT_APPLICABLE",
+         "detail": (f"{len(locked_pairs)} 张已开赛棋桌维持原选手与颜色"
+                    if locked_pairs else "本轮无锁定棋桌（全新发布）")},
     ]
 
 
 # ---------------------------------------------------------------- 无解诊断
 
-def _infeasible_report(players, required_byes, allow_repeat, override_reason):
-    """硬约束无解时给出结构化原因，绝不自动放松。"""
-    n = len(players)
+def _infeasible_report(present, locked_pairs, excluded, required_byes,
+                       allow_repeat, override_reason):
+    """硬约束无解时给出结构化原因，绝不自动放松。诊断对象为空闲选手子图。"""
+    locked_all = {x for pair in locked_pairs for x in pair}
+    free = [p for p in present if p.pid not in locked_all]
+    n = len(free)
 
-    # 用"允许重复交手"再试一次，区分无解根因
-    s_rep, _ = _build_and_solve(players, required_byes, True,
-                                with_objectives=False)
+    s_rep, _ = _build_and_solve(present, required_byes, True,
+                                locked_pairs, excluded, with_objectives=False)
     root = "NO_REPEAT" if s_rep is not None else "STRUCTURAL"
 
-    # 并查集：允许对阵图的连通分量
     parent = list(range(n))
 
     def find(x):
@@ -424,7 +499,7 @@ def _infeasible_report(players, required_byes, allow_repeat, override_reason):
     blocked_detail: dict[int, list[int]] = {}
     for a in range(n):
         for b in range(a + 1, n):
-            if players[b].pid not in players[a].opponents:
+            if free[b].pid not in free[a].opponents:
                 union(a, b)
             else:
                 blocked_edges += 1
@@ -437,22 +512,23 @@ def _infeasible_report(players, required_byes, allow_repeat, override_reason):
     sizes = [len(c) for c in comp.values()]
     odd_components = [c for c in comp.values() if len(c) % 2 == 1]
     o = len(odd_components)
-    # 每个奇数分量内部必须消化一个轮空；全体奇偶性抵消一个
     byes_needed = max(0, o - (n % 2)) + required_byes
 
-    bottlenecks = []
-    for k, opp_idxs in blocked_detail.items():
-        if len(opp_idxs) == n - 1:
-            bottlenecks.append(players[k].name)
+    bottlenecks = [free[k].name for k, opp_idxs in blocked_detail.items()
+                   if len(opp_idxs) == n - 1]
 
     infeas = {
         "root_cause": root,
         "message": (
-            "硬约束 NO_REPEAT 下不存在合法配对：允许对阵图无法在只安排 "
+            f"硬约束下不存在合法重排：{len(locked_pairs)} 张已开赛棋桌锁定、"
+            f"{len(excluded)} 人退赛后，空闲选手允许对阵图无法在只安排 "
             f"{required_byes} 个轮空的前提下完成配对。"
             if root == "NO_REPEAT"
-            else "即使允许重复交手仍无可行解，请检查参赛名单与轮空数量。"
+            else "即使允许重复交手仍无可行解，请检查锁定棋桌、退赛名单与轮空数量。"
         ),
+        "free_players": n,
+        "locked_boards": len(locked_pairs),
+        "withdrawn": len(excluded),
         "allowed_graph": {
             "component_sizes": sorted(sizes, reverse=True),
             "odd_component_count": o,
@@ -463,15 +539,16 @@ def _infeasible_report(players, required_byes, allow_repeat, override_reason):
         "isolated_players": bottlenecks,
         "options": [
             f"需要至少 {byes_needed} 个轮空来消化奇数连通分量，但规则只允许 {required_byes} 个",
-            "由裁判长通过 override 端点并填写理由，授权放宽 NO_REPEAT（系统会在对阵表与审计记录中显式标注）",
+            "由裁判长通过授权 override 并填写理由放宽 NO_REPEAT（全程显式标注）",
         ],
     }
 
     return PairingReport(
-        feasible=False,
-        rule_version=RULES_VERSION,
-        pairs=[], byes=[], player_reasons={}, tiers=[],
-        hard_constraints=_hard_status(n, [], [], allow_repeat),
+        feasible=False, rule_version=RULES_VERSION, pairs=[], byes=[],
+        player_reasons={}, tiers=[],
+        hard_constraints=_hard_status(len(present), len(excluded), [],
+                                      locked_pairs, [], allow_repeat),
+        locked_pairs=locked_pairs, excluded=sorted(excluded),
         infeasibility=infeas,
         overrides=[{"code": "NO_REPEAT", "reason": override_reason}] if allow_repeat else [],
     )

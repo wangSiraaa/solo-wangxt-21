@@ -177,7 +177,7 @@ def test_soft_constraints_never_break_hard_and_report_relaxed():
     # 第二轮发布后的"下一轮"是第 3 轮；这里主要校验报告结构完整
     rep = _status(tid, preview=True)["preview"]["report"]
     for hc in rep["hard_constraints"]:
-        assert hc["status"] in {"SATISFIED", "OVERRIDDEN"}
+        assert hc["status"] in {"SATISFIED", "OVERRIDDEN", "NOT_APPLICABLE"}
     assert any(t["tier"] == "A" for t in rep["tiers"])
     for pid, reason in rep["player_reasons"].items():
         assert reason["headline"]

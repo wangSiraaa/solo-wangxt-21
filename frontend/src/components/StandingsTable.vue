@@ -43,6 +43,10 @@ const tiedNames = (s) =>
           <td class="muted num">{{ s.registration_no }}</td>
           <td>
             {{ s.name }}
+            <span v-if="s.withdrawn" class="badge blocked" style="margin-left:6px"
+                  :title="`第 ${s.withdrawn_round_no} 轮退赛；既有成绩保留`">
+              退赛(R{{ s.withdrawn_round_no }})
+            </span>
             <span v-if="s.tied" class="tie-flag">⚑ 并列</span>
             <span v-if="s.correction_count" class="corr-flag"
                   :title="`涉及 ${s.correction_count} 次成绩更正`">

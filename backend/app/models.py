@@ -49,6 +49,14 @@ class Player(Base):
     rating: Mapped[int] = mapped_column(Integer, default=1000)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # 退赛（受控）：不删除记录。withdrawn_round_no = 退赛生效轮次
+    # （该轮及以后不再配对）；此前成绩全部保留，继续计入对手分。
+    withdrawn_round_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    withdrawn_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    withdrawn_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     tournament: Mapped["Tournament"] = relationship(back_populates="players")
 
 
@@ -73,7 +81,12 @@ class Round(Base):
 
     tournament: Mapped["Tournament"] = relationship(back_populates="rounds")
     games: Mapped[list["Game"]] = relationship(
-        back_populates="round", cascade="all, delete-orphan"
+        back_populates="round", cascade="all, delete-orphan",
+        foreign_keys="Game.round_id",
+    )
+    revisions: Mapped[list["PairingRevision"]] = relationship(
+        back_populates="round", cascade="all, delete-orphan",
+        order_by="PairingRevision.created_at",
     )
 
 
@@ -86,7 +99,9 @@ class Game(Base):
     """
     __tablename__ = "games"
     __table_args__ = (
-        UniqueConstraint("round_id", "white_id", "black_id", name="uq_game_pair"),
+        # 软唯一性在服务层保证：同一轮每人至多一张 *active* 棋桌。
+        # 不加数据库 UNIQUE，因为重排会保留 cancelled 棋桌的历史行，
+        # 且两人理论上可能在同一轮先取消再（经授权）重新对上。
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -94,13 +109,29 @@ class Game(Base):
     white_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"), nullable=True)
     black_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"), nullable=True)
     is_bye: Mapped[bool] = mapped_column(Boolean, default=False)
+    board_no: Mapped[int] = mapped_column(Integer, default=0)
+
+    # active：当前生效棋桌；cancelled：受控重排中撤销，保留行用于回看与审计
+    status: Mapped[str] = mapped_column(String(12), default="active")
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    revision_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pairing_revisions.id"), nullable=True
+    )
 
     verdict: Mapped[str] = mapped_column(String(8))
     current_result: Mapped[str] = mapped_column(String(8))
     entered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     entered_by: Mapped[str] = mapped_column(String(64), default="裁判组")
 
-    round: Mapped["Round"] = relationship(back_populates="games")
+    round: Mapped["Round"] = relationship(
+        back_populates="games", foreign_keys=[round_id]
+    )
+    revision: Mapped["PairingRevision | None"] = relationship(
+        back_populates="games", foreign_keys=[revision_id]
+    )
     corrections: Mapped[list["ResultCorrection"]] = relationship(
         back_populates="game", cascade="all, delete-orphan",
         order_by="ResultCorrection.created_at",
@@ -119,3 +150,39 @@ class ResultCorrection(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     game: Mapped["Game"] = relationship(back_populates="corrections")
+
+
+class PairingRevision(Base):
+    """受控重配对记录（与成绩更正互相独立的第二条审计线）。
+
+    原始发布内容保留在 rounds.pairing_snapshot，永不覆盖；
+    本表记录"在什么局面下、因何原因、把哪些棋桌改成了什么"，
+    确认前先存一行 draft（含方案指纹），确认时复检棋桌开赛状态。
+    """
+    __tablename__ = "pairing_revisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    round_id: Mapped[int] = mapped_column(ForeignKey("rounds.id"))
+    kind: Mapped[str] = mapped_column(String(24), default="controlled_repair")
+    status: Mapped[str] = mapped_column(String(12), default="draft")  # draft|applied|expired
+    reason: Mapped[str] = mapped_column(Text, default="")
+
+    # 生成方案时的局面指纹：{game_id: (status, started?), withdrawals: [...]}
+    situation_fingerprint: Mapped[str] = mapped_column(String(128))
+    diff_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    baseline_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    proposed_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    created_by: Mapped[str] = mapped_column(String(64), default="裁判组")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expiry_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    round: Mapped["Round"] = relationship(
+        back_populates="revisions", foreign_keys=[round_id]
+    )
+    games: Mapped[list["Game"]] = relationship(
+        back_populates="revision", foreign_keys="Game.revision_id"
+    )

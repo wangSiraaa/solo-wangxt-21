@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import models, schemas, services
+from . import models, repairs, schemas, services
 from .db import Base, engine, get_db
 from .rules import RULES
 
@@ -103,7 +103,41 @@ def enter_result(game_id: int, data: schemas.ResultIn,
 @app.post("/games/{game_id}/correction")
 def correct_result(game_id: int, data: schemas.CorrectionIn,
                    db: Session = Depends(get_db)):
-    g = services.correct_result(db, game_id, data.new_result,
-                                data.reason, data.created_by)
-    return {"id": g.id, "verdict": g.verdict, "current_result": g.current_result,
-            "note": "原裁定保留；积分与小分已按新结果重算"}
+    # 返回 dict（含排名影响与幂等标记），不再用 response_model 限定
+    return services.correct_result(db, game_id, data.new_result,
+                                   data.reason, data.created_by)
+
+
+# ---------------------------------------------------------------- 受控重配对
+
+@app.post("/games/{game_id}/start")
+def mark_started(game_id: int, db: Session = Depends(get_db)):
+    g = repairs.mark_started(db, game_id)
+    return {"id": g.id, "started": g.started_at is not None,
+            "started_at": g.started_at.isoformat() if g.started_at else None}
+
+
+@app.post("/tournaments/{tournament_id}/players/{player_id}/withdraw")
+def withdraw(tournament_id: int, player_id: int, data: schemas.WithdrawIn,
+             db: Session = Depends(get_db)):
+    p, cancelled = repairs.withdraw_player(
+        db, tournament_id, player_id, data.reason
+    )
+    return {"id": p.id, "name": p.name,
+            "withdrawn_round_no": p.withdrawn_round_no,
+            "auto_cancelled_game_ids": cancelled,
+            "note": "报名记录保留；既有成绩与对手小分继续计入排名"}
+
+
+@app.post("/tournaments/{tournament_id}/repairs/plan")
+def create_repair_plan(tournament_id: int, data: schemas.RepairPlanIn,
+                       db: Session = Depends(get_db)):
+    return repairs.create_repair_plan(
+        db, tournament_id,
+        allow_repeat=data.override_no_repeat, reason=data.override_reason,
+    )
+
+
+@app.post("/repairs/{revision_id}/confirm")
+def confirm_repair(revision_id: int, db: Session = Depends(get_db)):
+    return repairs.confirm_repair(db, revision_id)
