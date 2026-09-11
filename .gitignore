@@ -1,0 +1,25 @@
+# Local secrets and connection material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*.secret
+
+# Python environments and generated caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend dependencies and build output
+node_modules/
+frontend/dist/
+
+# Local SQLite runtime sidecars; the checked-in demo database remains available
+data/*.db-wal
+data/*.db-shm
+data/*.local.db
